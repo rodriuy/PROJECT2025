@@ -1,0 +1,6 @@
+firebase-admin
+sounddevice
+requests
+pygame
+mfrc522
+Pillow

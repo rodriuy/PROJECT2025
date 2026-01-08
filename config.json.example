@@ -1,0 +1,39 @@
+{
+   "kelly": {
+     "name": "Kelly",
+     "photo": "https://firebasestorage.googleapis.com/v0/b/YOUR_PROJECT.firebasestorage.app/o/KELLY.png?alt=media&token=YOUR_TOKEN",
+     "idle_video": "personas/KELLY_loop.mp4",
+     "planb_video": "personas/KELLY_loop.mp4",
+     "eleven_voice_id": "YOUR_ELEVEN_VOICE_ID",
+     "d_id_person_id": "YOUR_DID_PERSON_ID",
+     "context_prompt_file": "personas/kelly_prompt.txt"
+   },
+   "firebase": {
+     "service_account": "serviceAccountKey.json",
+     "device_status_doc": "devices/demo/deviceStatus",
+     "storage_bucket": "YOUR_PROJECT.firebasestorage.app"
+   },
+   "apis": {
+     "gemini_api_key": "YOUR_GEMINI_API_KEY",
+     "eleven_api_key": "YOUR_ELEVEN_API_KEY",
+     "d_id_api_key": "YOUR_D_ID_API_KEY",
+     "openai_api_key": "YOUR_OPENAI_API_KEY"
+   },
+   "auto_install_deps": true,
+   "nfc_map": {
+     "YOUR_NFC_TAG_ID": "personas/kelly_custom_video.mp4"
+   },
+   "audio": {
+     "record_seconds": 5,
+     "samplerate": 16000,
+     "channels": 1
+   },
+   "playback": {
+     "video_player_cmd": "mpv --no-audio-display --fs --really-quiet {file}",
+     "video_player_kill": "pkill -f \"mpv --no-audio-display --fs --really-quiet\""
+   },
+   "services": {
+      "transcription": "openai",
+      "llm": "gemini"
+    }
+ }

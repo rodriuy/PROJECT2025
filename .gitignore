@@ -1,0 +1,6 @@
+/serviceAccountKey.json
+/node_modules
+/.env
+/dist
+/.next
+/config.json

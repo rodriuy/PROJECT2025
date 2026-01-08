@@ -1,0 +1,585 @@
+rodriuy: muy bien!! pero.. podrías optimizar un poco para que no haya ese "corte" entre el video de d-id y el loop?, que haya una transcición limpia. tambien quiero el loop en el oobe
+
+GitHub Copilot: Solution — pasos:
+1. Iniciar/asegurar el idle loop siempre que se muestre OOBE (usar show_idle_video para evitar duplicados).
+2. Al comenzar a reproducir un video generado, asegurarse de que el idle video esté activo por debajo (si no, iniciarlo).
+3. Cuando el proceso del video generado termine, no bajar inmediatamente el frame: arrancar/asegurar el idle y esperar un breve retardo (crossfade buffer) antes de limpiar/lowering para evitar el “corte” brusco.
+4. Añadir un método interno _finalize_generated_cleanup que haga la limpieza (bajar el frame, borrar temp) tras el retardo.
+
+Cambios por archivo:
+
+### [main.py](file:///home/rodrigo/Documents/intentomemora-40/main.py)
+
+Actualizar la UI para asegurar loop en OOBE y transición suave entre video generado e idle. Se modifican show_oobe_screen, handle_event -> play_generated_video y ui_loop->generated proc handling; además se añade _finalize_generated_cleanup.
+
+````python
+# ...existing code...
+class CajaMemoraUI:
+    # ...existing code...
+
+    def show_oobe_screen(self):
+        # Start idle video loop in background during OOBE (behind overlay), like a video call
+-        idle = PERSON.get("idle_video")
+-        if idle and Path(idle).exists():
+-            proc = play_video_embedded(self.idle_video_frame, idle, loop=True)
+-            STATE["idle_proc"] = proc
++        # Ensure idle loop is running (use show_idle_video which reuses existing proc if posible)
++        try:
++            self.show_idle_video()
++        except Exception as e:
++            dbg("show_oobe_screen: no se pudo asegurar idle video: " + repr(e))
+        # Keep overlay on top for QR
+        try:
+            self.overlay_canvas.tkraise()
+        except Exception:
+            pass
+        self.overlay_canvas.delete("all")
+-        qr_path = BASE_DIR / "pairing_qr.png"
++        qr_path = BASE_DIR / "pairing_qr.png"
+        if qr_path.exists():
+            try:
+                img = Image.open(qr_path)
+                img.thumbnail((int(self.width*0.45), int(self.height*0.55)), Image.Resampling.LANCZOS)
+                self.qr_img = ImageTk.PhotoImage(img)
+                self.overlay_canvas.create_image(self.width//2, self.height//2 - 40, image=self.qr_img, anchor="center")
+            except Exception:
+                pass
+        self.set_status("oobe", "Escanea para emparejar")
+
++    def _finalize_generated_cleanup(self):
++        """
++        Final cleanup after generated video finishes + short buffer to avoid abrupt cut.
++        Called via root.after to allow idle player to start underneath.
++        """
++        try:
++            # Lower generated frame and remove temp if any
++            try:
++                self.generated_video_frame.lower()
++            except Exception:
++                pass
++            tmp_path = STATE.get("generated_temp")
++            if tmp_path and Path(tmp_path).exists():
++                try:
++                    os.unlink(tmp_path)
++                except Exception:
++                    pass
++            STATE["generated_proc"] = None
++            STATE["generated_path"] = None
++            STATE["generated_temp"] = None
++        finally:
++            # clear pending flag
++            STATE.pop("generated_cleanup_pending", None)
++            # return to idle state
++            STATE["mode"] = "idle"
++            self.set_status("idle", "idle video")
++
+    def ui_loop(self):
+        # procesar cola de eventos
+        # ...existing code...
+-        # Check generated proc
+-        gen_proc = STATE.get("generated_proc")
+-        if gen_proc and gen_proc.poll() is not None:
+-            # Generated proc ended, lower the frame and clean up
+-            self.generated_video_frame.lower()
+-            tmp_path = STATE.get("generated_temp")
+-            if tmp_path and Path(tmp_path).exists():
+-                try:
+-                    os.unlink(tmp_path)
+-                except Exception:
+-                    pass
+-            STATE["generated_proc"] = None
+-            STATE["generated_path"] = None
+-            STATE["generated_temp"] = None
+-            # Go back to idle mode
+-            self.set_status("idle", "Idle")
+-            STATE["mode"] = "idle"
++        # Check generated proc: if ended, don't cut immediately — ensure idle is running and finalize after small delay
++        gen_proc = STATE.get("generated_proc")
++        if gen_proc and gen_proc.poll() is not None:
++            if not STATE.get("generated_cleanup_pending"):
++                STATE["generated_cleanup_pending"] = True
++                # Ensure idle is playing underneath (this will reuse existing idle if present)
++                try:
++                    self.show_idle_video()
++                except Exception as e:
++                    dbg("ui_loop: fallo al asegurar idle tras generated end: " + repr(e))
++                # Wait a bit so mpv idle can appear smoothly, then finalize cleanup
++                try:
++                    self.root.after(800, lambda: self._finalize_generated_cleanup())
++                except Exception:
++                    # fallback immediate finalize
++                    self._finalize_generated_cleanup()
+ 
+        # standby por inactividad
+        # ...existing code...
+
+    def handle_event(self, ev):
+        typ = ev[0]
+        payload = ev[1] if len(ev) > 1 else None
+        if typ == "status":
+            self.set_status(payload.get("state"), payload.get("msg"))
+        elif typ == "log":
+            self.append_log(payload)
+        elif typ == "enable_hablar":
+            try:
+                self.hablar_btn.config(state="normal", text="HABLAR")
+            except Exception:
+                pass
+        elif typ == "show_avatar":
+            try:
+                self.show_avatar()
+            except Exception:
+                pass
+        elif typ == "play_generated_video":
+            try:
+                if isinstance(payload, dict):
+                    path = payload.get("path")
+                    is_temp = bool(payload.get("temp"))
+                else:
+                    path = payload
+                    is_temp = False
+-                # Play generated video in the generated frame, raise it on top
+-                self.generated_video_frame.tkraise()
+-                proc = play_video_embedded(self.generated_video_frame, path, loop=False)
+-                STATE["generated_proc"] = proc
+-                STATE["generated_path"] = path
+-                STATE["generated_temp"] = path if is_temp else None  # Fix: store path if temp, else None
+-                # Lower overlay
+-                try:
+-                    self.overlay_canvas.tk.call('lower', self.overlay_canvas._w)
+-                except Exception:
+-                    pass
+-                self.set_status("playing", "reproduciendo generado")
+-                STATE["mode"] = "playing"
++                # Ensure idle is running underneath to allow smooth transition back (no instant black)
++                try:
++                    self.show_idle_video()
++                except Exception:
++                    pass
++                # Play generated video in the generated frame, raise it on top
++                self.generated_video_frame.tkraise()
++                proc = play_video_embedded(self.generated_video_frame, path, loop=False)
++                STATE["generated_proc"] = proc
++                STATE["generated_path"] = path
++                STATE["generated_temp"] = path if is_temp else None
++                # ensure any previous cleanup flag cleared
++                STATE.pop("generated_cleanup_pending", None)
++                # Lower overlay so video visible
++                try:
++                    self.overlay_canvas.tk.call('lower', self.overlay_canvas._w)
++                except Exception:
++                    pass
++                self.set_status("playing", "reproduciendo generado")
++                STATE["mode"] = "playing"
+            except Exception as e:
+                self.append_log(f"Error reproduciendo embebido: {repr(e)}")
+                plan_b_play()
+        elif typ == "firebase_status":
+            if isinstance(payload, dict) and payload.get("mode") == "standby":
+                self.show_slideshow()
+            elif isinstance(payload, dict) and payload.get("mode") == "idle":
+                self.show_idle_video()
+# ...existing code...
+````
+
+Notas rápidas de integración:
+- He usado root.after(800) como retardo para el "buffer" de transición; ajusta el tiempo (ms) si quieres más o menos overlap.
+- La función show_idle_video ya comprueba si el idle_proc actual corresponde al mismo archivo y está vivo; por eso la llamada preventiva antes de reproducir el video generado no lanzará duplicados y permite que el idle esté disponible para revelarse al terminar el generado.
+- No he introducido dependencias externas ni cambios en mpv; la solución usa el comportamiento actual (mpv en dos widgets) y un pequeño retardo para eliminar el corte brusco.
+
+Si quieres un crossfade real (mezclar cuadros) tendríamos que emplear mpv filters o reproducir ambos videos con un compositor y controlar alpha — puedo proponer eso si quieres más inversión y pruebas.
+
+Made changes.
+
+rodriuy: quiero que la grabación de audio termine cuando yo suelte el mouse nomás, no antes. si no, da lo mismo
+
+GitHub Copilot: Solución (pasos):
+1. Hacer que record_audio_wav respete la señal STATE["stop_recording"] para cortar la grabación en cuanto sueltes el mouse.
+2. Implementar esto para los tres backends: sounddevice (lectura en bucle y escritura WAV), arecord (subproceso sin -d y terminarlo), ffmpeg (subproceso y terminarlo).
+3. Asegurar que al iniciar la grabación se resetee STATE["stop_recording"]=False y que _on_hablar_release marque la bandera True (ya estaba).
+4. Mantener un tiempo máximo (RECORD_SECONDS) como fallback por si la señal no llega.
+
+Cambios por archivo:
+
+### [main.py](file:///home/rodrigo/Documents/intentomemora-40/main.py)
+
+Modificar record_audio_wav y _start_recording para parar la grabación en la suelta del botón.
+
+````python
+# ...existing code...
+def record_audio_wav(seconds=RECORD_SECONDS, samplerate=SAMPLERATE, channels=CHANNELS):
+    event_q.put(("status", {"state": "recording", "msg": "Grabando audio..."}))
+    global SD_AVAILABLE
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmpname = tmp.name
+    tmp.close()
+    dbg(f"Intentando grabar audio {seconds}s -> {tmpname}")
+-    if SD_AVAILABLE:
+-        try:
+-            recording = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=channels, dtype='int16')
+-            sd.wait()
+-            wf = wave.open(tmpname, 'wb')
+-            wf.setnchannels(channels)
+-            wf.setsampwidth(2)
+-            wf.setframerate(samplerate)
+-            wf.writeframes(recording.tobytes())
+-            wf.close()
+-            event_q.put(("log", f"Grabación completada (sounddevice): {tmpname}"))
+-            return tmpname
+-        except ImportError as e:
+-            event_q.put(("log", f"ImportError grabando audio: {repr(e)}"))
+-            SD_AVAILABLE = False
+-        except Exception as e:
+-            event_q.put(("log", f"Error grabando audio (sounddevice): {repr(e)}"))
+-            SD_AVAILABLE = False
++    # Reset stop flag if present (caller _start_recording sets it too)
++    try:
++        STATE["stop_recording"] = False
++    except Exception:
++        pass
++
++    # Prefer sounddevice: read in small chunks and stop when user releases (STATE["stop_recording"]=True)
++    if SD_AVAILABLE:
++        try:
++            import wave as _wave
++            frames = []
++            chunk_secs = 0.1
++            chunk_frames = int(samplerate * chunk_secs)
++            with sd.RawInputStream(samplerate=samplerate, channels=channels, dtype='int16') as stream:
++                start = time.time()
++                while not STATE.get("stop_recording") and (time.time() - start) < seconds:
++                    try:
++                        data = stream.read(chunk_frames)[0]  # raw bytes
++                        frames.append(data)
++                    except Exception:
++                        # transient read error, continue
++                        time.sleep(0.01)
++                # if user never released, we may have reached timeout
++            # write frames to wav
++            try:
++                wf = _wave.open(tmpname, 'wb')
++                wf.setnchannels(channels)
++                wf.setsampwidth(2)
++                wf.setframerate(samplerate)
++                for chunk in frames:
++                    wf.writeframes(chunk)
++                wf.close()
++            except Exception as e:
++                dbg("Error escribiendo WAV (sounddevice path): " + repr(e))
++                if os.path.exists(tmpname):
++                    os.unlink(tmpname)
++                raise
++            event_q.put(("log", f"Grabación completada (sounddevice): {tmpname}"))
++            return tmpname
++        except Exception as e:
++            dbg("Error grabando audio (sounddevice path): " + repr(e))
++            SD_AVAILABLE = False
++            # caer al fallback de arecord/ffmpeg
+     arecord_path = shutil.which("arecord")
+-    if arecord_path:
+-        try:
+-            cmd = [arecord_path, "-f", "S16_LE", "-r", str(samplerate), "-c", str(channels), "-d", str(seconds), "-t", "wav", tmpname]
+-            dbg("Grabando con arecord: " + " ".join(shlex.quote(p) for p in cmd))
+-            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=seconds + 10)
+-            event_q.put(("log", f"Grabación completada (arecord): {tmpname}"))
+-            return tmpname
+-        except Exception as e:
+-            event_q.put(("log", f"arecord error: {repr(e)}"))
+-            if os.path.exists(tmpname):
+-                os.unlink(tmpname)
+-            raise
++    if arecord_path:
++        try:
++            # start arecord without explicit -d so we can terminate it when user releases
++            cmd = [arecord_path, "-f", "S16_LE", "-r", str(samplerate), "-c", str(channels), "-t", "wav", tmpname]
++            dbg("Grabando con arecord (duración indefinida, esperando release): " + " ".join(shlex.quote(p) for p in cmd))
++            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            start = time.time()
++            while proc.poll() is None and not STATE.get("stop_recording") and (time.time() - start) < (seconds + 5):
++                time.sleep(0.05)
++            # terminate gracefully
++            if proc.poll() is None:
++                try:
++                    proc.terminate()
++                    proc.wait(timeout=1.0)
++                except Exception:
++                    try:
++                        proc.kill()
++                    except Exception:
++                        pass
++            # validate file
++            if os.path.exists(tmpname) and os.path.getsize(tmpname) > 100:
++                event_q.put(("log", f"Grabación completada (arecord): {tmpname}"))
++                return tmpname
++            raise RuntimeError("arecord no produjo archivo válido")
++        except Exception as e:
++            event_q.put(("log", f"arecord error: {repr(e)}"))
++            if os.path.exists(tmpname):
++                os.unlink(tmpname)
++            raise
+     ffmpeg_path = shutil.which("ffmpeg") or shutil.which("avconv")
+     if ffmpeg_path:
+-        try:
+-            cmd = [ffmpeg_path, "-y", "-f", "alsa", "-ac", str(channels), "-ar", str(samplerate), "-t", str(seconds), "-i", "default", tmpname]
+-            dbg("Grabando con ffmpeg: " + " ".join(shlex.quote(p) for p in cmd))
+-            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=seconds + 15)
+-            event_q.put(("log", f"Grabación completada (ffmpeg): {tmpname}"))
+-            return tmpname
+-        except Exception as e:
+-            event_q.put(("log", f"ffmpeg error: {repr(e)}"))
+-            if os.path.exists(tmpname):
+-                os.unlink(tmpname)
+-            raise
++        try:
++            # start ffmpeg without -t so we can stop it when user releases
++            cmd = [ffmpeg_path, "-y", "-f", "alsa", "-ac", str(channels), "-ar", str(samplerate), "-i", "default", tmpname]
++            dbg("Grabando con ffmpeg (duración indefinida, esperando release): " + " ".join(shlex.quote(p) for p in cmd))
++            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            start = time.time()
++            while proc.poll() is None and not STATE.get("stop_recording") and (time.time() - start) < (seconds + 5):
++                time.sleep(0.05)
++            if proc.poll() is None:
++                try:
++                    proc.terminate()
++                    proc.wait(timeout=1.0)
++                except Exception:
++                    try:
++                        proc.kill()
++                    except Exception:
++                        pass
++            if os.path.exists(tmpname) and os.path.getsize(tmpname) > 100:
++                event_q.put(("log", f"Grabación completada (ffmpeg): {tmpname}"))
++                return tmpname
++            raise RuntimeError("ffmpeg no produjo archivo válido")
++        except Exception as e:
++            event_q.put(("log", f"ffmpeg error: {repr(e)}"))
++            if os.path.exists(tmpname):
++                os.unlink(tmpname)
++            raise
+     event_q.put(("log", "No hay backend de grabación disponible (sounddevice / arecord / ffmpeg)"))
+     if os.path.exists(tmpname):
+         os.unlink(tmpname)
+     raise RuntimeError("No available audio recorder (sounddevice/arecord/ffmpeg)")
+# ...existing code...
+class CajaMemoraUI:
+    # ...existing code...
+     def _start_recording(self):
+         # Handle recording in a separate thread for press-hold
+-        STATE["recording_in_progress"] = True
+-        try:
+-            # Record until stop signal
+-            wav = record_audio_wav()  # Modify record_audio_wav to respect stop signal if needed, but for now keep fixed duration
+-            STATE["recorded_wav"] = wav
+-        except Exception as e:
+-            event_q.put(("log", f"Recording error: {repr(e)}"))
+-        STATE["recording_in_progress"] = False
++        STATE["recording_in_progress"] = True
++        try:
++            # ensure stop flag cleared and then record (will stop when user releases)
++            STATE["stop_recording"] = False
++            wav = record_audio_wav(seconds=RECORD_SECONDS)
++            STATE["recorded_wav"] = wav
++        except Exception as e:
++            event_q.put(("log", f"Recording error: {repr(e)}"))
++        finally:
++            STATE["recording_in_progress"] = False
+ # ...existing code...
+````
+
+Notas:
+- La grabación ahora se interrumpe al soltar (STATE["stop_recording"]=True en _on_hablar_release). Se mantiene RECORD_SECONDS como máximo por seguridad.
+- Si sounddevice falla, se emplea arecord/ffmpeg lanzados sin duración fija y se terminan cuando el usuario suelta.
+- Ajusta chunk_secs o timeouts si necesitas latencia distinta.
+
+Made changes.
+
+rodriuy: (venv) rodrigo@LinuxMint:~/Documents/intentomemora-40$ python3 main.py
+  File "/home/rodrigo/Documents/intentomemora-40/main.py", line 319
+    dbg("Grabando con arecord (duración indefinida, esperando
+        ^
+SyntaxError: unterminated string literal (detected at line 319)
+
+GitHub Copilot: Plan:
+1. Corregir la cadena truncada e implementar correctamente el fallback con arecord/ffmpeg.
+2. Hacer que arecord pueda grabar indefinidamente y terminar al detectar STATE["stop_recording"] (presionado el botón).
+3. Restaurar el flujo que borra el archivo temporal y notifica errores.
+
+Cambios por archivo:
+
+### [main.py](file:///home/rodrigo/Documents/intentomemora-40/main.py)
+
+Arreglar record_audio_wav: completar la rama de arecord (grabación indefinida que termina al soltar) y restaurar el fallback ffmpeg; evitar cadena sin cerrar que provocaba SyntaxError.
+
+````python
+# ...existing code...
+def record_audio_wav(seconds=RECORD_SECONDS, samplerate=SAMPLERATE, channels=CHANNELS):
+    event_q.put(("status", {"state": "recording", "msg": "Grabando audio..."}))
+    global SD_AVAILABLE
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmpname = tmp.name
+    tmp.close()
+    dbg(f"Intentando grabar audio {seconds}s -> {tmpname}")
+    # Reset stop flag if present (caller _start_recording sets it too)
+    try:
+        STATE["stop_recording"] = False
+    except Exception:
+        pass
+
+    # Prefer sounddevice: read in small chunks and stop when user releases (STATE["stop_recording"]=True)
+    if SD_AVAILABLE:
+        try:
+            import wave as _wave
+            frames = []
+            chunk_secs = 0.1
+            chunk_frames = int(samplerate * chunk_secs)
+            with sd.RawInputStream(samplerate=samplerate, channels=channels, dtype='int16') as stream:
+                start = time.time()
+                while not STATE.get("stop_recording") and (time.time() - start) < seconds:
+                    try:
+                        data = stream.read(chunk_frames)[0]  # raw bytes
+                        frames.append(data)
+                    except Exception:
+                        # transient read error, continue
+                        time.sleep(0.01)
+            # write frames to wav
+            try:
+                wf = _wave.open(tmpname, 'wb')
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)
+                wf.setframerate(samplerate)
+                for chunk in frames:
+                    wf.writeframes(chunk)
+                wf.close()
+            except Exception as e:
+                dbg("Error escribiendo WAV (sounddevice path): " + repr(e))
+                if os.path.exists(tmpname):
+                    os.unlink(tmpname)
+                raise
+            event_q.put(("log", f"Grabación completada (sounddevice): {tmpname}"))
+            return tmpname
+        except Exception as e:
+            dbg("Error grabando audio (sounddevice path): " + repr(e))
+            SD_AVAILABLE = False
+            # caer al fallback de arecord/ffmpeg
+
+    arecord_path = shutil.which("arecord")
+    if arecord_path:
+        try:
+            # start arecord without explicit -d so we can terminate it when user releases
+            cmd = [arecord_path, "-f", "S16_LE", "-r", str(samplerate), "-c", str(channels), "-t", "wav", tmpname]
+            dbg("Grabando con arecord (duración indefinida): " + " ".join(shlex.quote(p) for p in cmd))
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            start = time.time()
+            # Wait until user releases or process ends or a safety timeout
+            safety_timeout = seconds + 10
+            while proc.poll() is None and not STATE.get("stop_recording") and (time.time() - start) < safety_timeout:
+                time.sleep(0.1)
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    proc.kill()
+            # verify file exists and has more than WAV header
+            if os.path.exists(tmpname) and os.path.getsize(tmpname) > 44:
+                event_q.put(("log", f"Grabación completada (arecord): {tmpname}"))
+                return tmpname
+            else:
+                raise RuntimeError("arecord produced empty or invalid file")
+        except Exception as e:
+            event_q.put(("log", f"arecord error: {repr(e)}"))
+            if os.path.exists(tmpname):
+                try:
+                    os.unlink(tmpname)
+                except Exception:
+                    pass
+            # fall through to ffmpeg fallback
+
+    ffmpeg_path = shutil.which("ffmpeg") or shutil.which("avconv")
+    if ffmpeg_path:
+        try:
+            cmd = [ffmpeg_path, "-y", "-f", "alsa", "-ac", str(channels), "-ar", str(samplerate), "-t", str(seconds), "-i", "default", tmpname]
+            dbg("Grabando con ffmpeg: " + " ".join(shlex.quote(p) for p in cmd))
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=seconds + 15)
+            event_q.put(("log", f"Grabación completada (ffmpeg): {tmpname}"))
+            return tmpname
+        except Exception as e:
+            event_q.put(("log", f"ffmpeg error: {repr(e)}"))
+            if os.path.exists(tmpname):
+                try:
+                    os.unlink(tmpname)
+                except Exception:
+                    pass
+            raise
+
+    event_q.put(("log", "No hay backend de grabación disponible (sounddevice / arecord / ffmpeg)"))
+    if os.path.exists(tmpname):
+        try:
+            os.unlink(tmpname)
+        except Exception:
+            pass
+    raise RuntimeError("No available audio recorder (sounddevice/arecord/ffmpeg)")
+# ...existing code...
+````
+
+Integración rápida:
+- El cambio corrige la cadena truncada y añade la lógica para terminar arecord cuando el usuario suelta el botón.
+- Ajusta un timeout de seguridad para evitar bucles infinitos.
+- Si quieres bajar el timeout o comportamiento exacto, indícame el valor preferido.
+
+Made changes.
+
+rodriuy: puedes enlistar todos las librerias y cosas que hay que instalar en  este proyecto?
+
+GitHub Copilot: GitHub Copilot
+
+Resumen breve — qué instalar y configurar:
+
+Pip / Python (recomendado dentro de un venv)
+- Instalar las dependencias del proyecto:
+  - pip install -r requirements.txt
+- Paquetes adicionales usados en el código (si no están en requirements.txt):
+  - google-genai
+  - google-cloud-speech
+  - elevenlabs
+  - numpy
+  - (opcional para MFRC522 en algunos entornos) spidev, RPi.GPIO
+- Ejemplo:
+  - python3 -m pip install -r requirements.txt google-genai google-cloud-speech elevenlabs numpy spidev RPi.GPIO
+
+Paquetes / utilidades del sistema (apt / distro):
+- mpv (reproducción embebida)
+- ffmpeg (fallback para grabación/transformaciones)
+- alsa-utils (arecord)
+- portaudio / libasound dev packages (para sounddevice):
+  - libasound2-dev portaudio19-dev libportaudiocpp0 libsndfile1-dev
+- tkinter (python3-tk) — GUI
+- build-essential, python3-dev, libjpeg-dev, zlib1g-dev (para compilar ruedas Pillow/u otras libs)
+- Ejemplo (Debian/Ubuntu):
+  - sudo apt update && sudo apt install -y mpv ffmpeg alsa-utils libasound2-dev portaudio19-dev libsndfile1-dev python3-tk build-essential python3-dev libjpeg-dev zlib1g-dev
+
+Hardware y configuración del sistema
+- Si usas MFRC522 en Raspberry Pi:
+  - Habilitar SPI (raspi-config → Interface Options → SPI)
+  - Instalar python3-spidev y RPi.GPIO (o pigpio según tu hardware)
+  - Conectar correctamente pines MOSI/MISO/SCLK/SS/GND/3.3V al lector
+- Permisos audio: añade el usuario al grupo "audio" si hay problemas con arecord/sounddevice:
+  - sudo usermod -aG audio <usuario>
+
+Credenciales y ficheros de configuración
+- config.json obligatorio en la carpeta del proyecto (con claves y paths).
+- Firebase (opcional):
+  - Service account JSON si vas a usar firebase_admin (poner path en config.firebase.service_account)
+  - Storage bucket (si quieres subir audios)
+- Claves/API:
+  - GEMINI_API_KEY (o configurar en config.apis.gemini_api_key) — opcional
+  - OPENAI_API_KEY — si usas Whisper HTTP
+  - ELEVEN_KEY (ElevenLabs) + eleven_voice_id en persona
+  - D_ID_KEY / config.d_id_api_key y opcional config.d_id_auth_type (bearer/basic/x-api-key) para D-ID
+- Otros: asegúrate de tener acceso a Internet para llamadas a APIs y descargas.
+
+Opcionales / mejoras
+- Si usas sounddevice y falla, instala numpy primero: pip install numpy
+- Para evitar cortes más suaves entre videos: mpv debe estar instalado y configurado; la solución del proyecto usa dos instancias mpv (idle + generated).
+
+Si quieres, genero un comando ready-to-run (apt + pip) adaptado a tu sistema (Debian/Ubuntu o Raspberry Pi) y una checklist de config.json con claves esperadas.
